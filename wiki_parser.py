@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 # pcap_to_html.py — batch convert ./pcap/*.pcap → ./html/*.html
-# No CSS, no JS, markup-only.
+# Markup-only output (no JS, no CSS). lxml + Python transform, XSLT-free.
 
 import os
-import subprocess
+import re
 import sys
-import html
-import xml.etree.ElementTree as ET
+from subprocess import run, PIPE
+import argparse
+import html as htmlesc
+import lxml.etree as et
 
-EM = "\u2003"  # indent
+EM = "\u2003"  # Wireshark-like indent
 
 HTML_HEADER = """<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
+<meta charset="utf-8"/>
 <title>{title}</title>
 </head>
 <body>
@@ -25,119 +27,139 @@ HTML_FOOTER = """
 </html>
 """
 
-DEFAULT_TSHARK_PATHS = [
-    "tshark",
-    r"C:\Program Files\Wireshark\tshark.exe",
-    r"C:\Program Files (x86)\Wireshark\tshark.exe",
-]
+# ---------- PDML → Markup-only HTML (Python "transform") ----------
 
-def run_tshark_to_pdml(pcap_path: str) -> str:
-    last_err = None
-    for exe in DEFAULT_TSHARK_PATHS:
-        try:
-            out = subprocess.check_output(
-                [exe, "-I", "-T", "pdml", "-r", pcap_path],
-                stderr=subprocess.STDOUT
-            )
-            return out.decode("utf-8", errors="replace")
-        except FileNotFoundError as e:
-            last_err = e
-            continue
-        except subprocess.CalledProcessError as e:
-            sys.stderr.write(e.output.decode("utf-8", errors="replace"))
-            raise RuntimeError("tshark failed.") from e
-    raise FileNotFoundError("Could not run tshark. Is Wireshark installed?") from last_err
+def _safe(s: str) -> str:
+    return htmlesc.escape(s or "", quote=True)
 
-def safe(s: str) -> str:
-    return html.escape(s or "", quote=True)
-
-def split_showname(sn: str) -> tuple[str, str]:
-    # "Foo: Bar: Baz" -> ("Foo", "Bar: Baz") to keep everything
+def _split_showname(sn: str) -> tuple[str, str]:
+    # "Foo: Bar: Baz" -> ("Foo", "Bar: Baz")
     if not sn:
         return "", ""
     left, sep, right = sn.partition(":")
-    if not sep:
-        return sn.strip(), ""
-    return left.strip(), right.strip()
+    return (sn.strip(), "") if not sep else (left.strip(), right.strip())
 
-def field_label_and_value(n: ET.Element) -> tuple[str, str]:
-    # Prefer splitting showname; then merge in attrs so nothing is lost.
+def _label_value_from_field(n: et._Element) -> tuple[str, str]:
+    # Prefer showname split; then add PDML attrs if they add info.
     showname = n.get("showname") or ""
-    left, right = split_showname(showname)
-
-    # Base label/value
+    left, right = _split_showname(showname)
     label = left or n.get("name") or n.get("show") or "field"
-    value_parts = []
 
-    # Right side of showname (if any)
+    value_parts = []
     if right:
         value_parts.append(right)
 
-    # PDML attributes (only add if they add new info)
-    attr_show = n.get("show")
-    attr_value = n.get("value")
-    # Avoid duplicate when right already equals attr_show
-    for extra in (attr_show, attr_value):
+    # Merge attributes without duplicates
+    for extra in (n.get("show"), n.get("value")):
         if extra and extra not in value_parts:
             value_parts.append(extra)
 
     return label, " | ".join(value_parts)
 
-def render_field_rows(n: ET.Element, level: int, rows_out: list[str]) -> None:
-    label, val = field_label_and_value(n)
-    desc = (EM * level) + safe(label)
-    rows_out.append(f"<tr><td>{desc}</td><td>{safe(val)}</td></tr>\n")
+def _render_field_rows(n: et._Element, level: int, out_rows: list[str]) -> None:
+    label, val = _label_value_from_field(n)
+    desc = (EM * level) + _safe(label)
+    out_rows.append(f"<tr><td>{desc}</td><td>{_safe(val)}</td></tr>\n")
     for child in n.findall("field"):
-        render_field_rows(child, level + 1, rows_out)
+        _render_field_rows(child, level + 1, out_rows)
 
-def proto_title(p: ET.Element) -> str:
+def _proto_title(p: et._Element) -> str:
     return p.get("showname") or p.get("name") or "proto"
 
-def render_proto_block(proto: ET.Element) -> str:
-    title = safe(proto_title(proto))
+def _render_proto(proto: et._Element) -> str:
+    title = _safe(_proto_title(proto))
     rows = [f"<tr><td colspan='2'><b>{title}</b></td></tr>\n"]
     for f in proto.findall("field"):
-        render_field_rows(f, 0, rows)
-    nested_html = [render_proto_block(sp) for sp in proto.findall("proto")]
+        _render_field_rows(f, 0, rows)
+    nested = "".join(_render_proto(sp) for sp in proto.findall("proto"))
     table_html = "<table>\n" + "".join(rows) + "</table>\n"
-    return f"<details><summary>{title}</summary>\n{table_html}{''.join(nested_html)}</details>\n"
+    return f"<details><summary>{title}</summary>\n{table_html}{nested}</details>\n"
 
-def render_packet(pkt: ET.Element, idx: int) -> str:
-    protos = [render_proto_block(p) for p in pkt.findall("proto")]
-    return f"<h2>Packet {idx}</h2>\n<details><summary>Packet {idx} details</summary>\n{''.join(protos)}</details>\n"
-
-def pdml_to_html(pdml_text: str, title: str) -> str:
-    root = ET.fromstring(pdml_text)
-    packets = root.findall(".//packet")
-    parts = [HTML_HEADER.format(title=html.escape(title))]
+def pdml_to_html_markup_only(dom: et._Element, title: str) -> bytes:
+    packets = dom.findall(".//packet")
+    parts = [HTML_HEADER.format(title=_safe(title))]
     for i, pkt in enumerate(packets, start=1):
-        parts.append(render_packet(pkt, i))
+        protos = "".join(_render_proto(p) for p in pkt.findall("proto"))
+        parts.append(
+            f"<h2>Packet {i}</h2>\n"
+            f"<details><summary>Packet {i} details</summary>\n{protos}</details>\n"
+        )
     parts.append(HTML_FOOTER)
-    return "".join(parts)
+    return "".join(parts).encode("utf-8")
 
-def main():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    pcap_dir = os.path.join(base_dir, "pcap")
-    html_dir = os.path.join(base_dir, "html")
-    os.makedirs(html_dir, exist_ok=True)
+# ---------- I/O pipeline (same logic/shape as your XSLT script) ----------
 
-    pcaps = [f for f in os.listdir(pcap_dir) if f.lower().endswith(".pcap")]
-    if not pcaps:
-        sys.exit("No .pcap files found in ./pcap")
+def pcap_to_html(pcap_file_path: str, html_file_path: str) -> None:
+    """
+    Converts a PCAP file to an HTML file (markup-only).
+    """
+    # If HTML already exists, skip (same behavior)
+    if os.path.exists(html_file_path):
+        print(f"HTML file already exists: {html_file_path}. Skipping creation.")
+        return
 
-    for fname in pcaps:
-        pcap_path = os.path.join(pcap_dir, fname)
-        out_name = os.path.splitext(fname)[0] + ".html"
-        out_path = os.path.join(html_dir, out_name)
+    # Full path to tshark executable (default install path on Windows)
+    tshark_path = r"C:\Program Files\Wireshark\tshark.exe"
 
-        print(f"[+] Converting {fname} → {out_name}")
-        pdml = run_tshark_to_pdml(pcap_path)
-        html_out = pdml_to_html(pdml, f"{fname} — Decode")
+    # Run tshark and capture PDML
+    result = run(
+        [tshark_path, "-I", "-T", "pdml", "-r", pcap_file_path],
+        stdout=PIPE,
+        stderr=PIPE
+    )
+    if result.returncode != 0:
+        print(f"Error running tshark on {pcap_file_path}:", result.stderr.decode(errors="replace"))
+        return
 
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(html_out)
+    # Parse PDML
+    try:
+        dom = et.fromstring(result.stdout)
+    except et.XMLSyntaxError as e:
+        print(f"PDML parse error for {pcap_file_path}: {e}")
+        return
 
-    print("All pcaps converted.")
+    # Transform PDML → HTML (markup-only, no JS/CSS)
+    html_bytes = pdml_to_html_markup_only(dom, os.path.basename(pcap_file_path))
+
+    # Ensure output dir exists
+    os.makedirs(os.path.dirname(html_file_path), exist_ok=True)
+
+    # Write HTML
+    with open(html_file_path, "wb") as f:
+        f.write(html_bytes)
+
+    print(f"HTML file created: {html_file_path}")
+
+def needs_update(pcap_path: str, html_path: str) -> bool:
+    """
+    Return True if HTML doesn't exist or PCAP is newer.
+    """
+    if not os.path.exists(html_path):
+        return True
+    return os.path.getmtime(pcap_path) > os.path.getmtime(html_path)
+
+def main(pcap_folder: str, html_folder: str) -> None:
+    """
+    Scan PCAP folder, convert to HTML in html_folder,
+    only if HTML is missing or out-of-date.
+    """
+    os.makedirs(html_folder, exist_ok=True)
+
+    for filename in os.listdir(pcap_folder):
+        if filename.lower().endswith(".pcap"):
+            pcap_path = os.path.join(pcap_folder, filename)
+            html_filename = os.path.splitext(filename)[0] + ".html"
+            html_path = os.path.join(html_folder, html_filename)
+
+            if needs_update(pcap_path, html_path):
+                print(f"Processing: {pcap_path}")
+                pcap_to_html(pcap_path, html_path)
+            else:
+                print(f"Up-to-date HTML exists for {filename}, skipping.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Batch convert PCAP files to HTML (markup-only)")
+    parser.add_argument("--pcap_dir", default="pcap", help="Directory containing PCAP files")
+    parser.add_argument("--html_dir", default="html", help="Directory to save HTML files")
+    args = parser.parse_args()
+    main(args.pcap_dir, args.html_dir)
