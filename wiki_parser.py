@@ -9,7 +9,6 @@ import html
 import xml.etree.ElementTree as ET
 
 EM = "\u2003"  # indent
-SKIP_PROTO_NAMES = {"fake-field-wrapper"}
 
 HTML_HEADER = """<!DOCTYPE html>
 <html lang="en">
@@ -49,27 +48,45 @@ def run_tshark_to_pdml(pcap_path: str) -> str:
             raise RuntimeError("tshark failed.") from e
     raise FileNotFoundError("Could not run tshark. Is Wireshark installed?") from last_err
 
-def field_label(n: ET.Element) -> str:
-    showname = n.get("showname")
-    if showname:
-        return showname
-    name = n.get("name") or n.get("show") or "field"
-    val = n.get("value")
-    return f"{name}: {val}" if val else name
-
-def field_value(n: ET.Element) -> str:
-    showname = n.get("showname") or ""
-    if ":" in showname:
-        return ""
-    return n.get("value") or n.get("show") or ""
-
 def safe(s: str) -> str:
-    return html.escape(s, quote=True)
+    return html.escape(s or "", quote=True)
+
+def split_showname(sn: str) -> tuple[str, str]:
+    # "Foo: Bar: Baz" -> ("Foo", "Bar: Baz") to keep everything
+    if not sn:
+        return "", ""
+    left, sep, right = sn.partition(":")
+    if not sep:
+        return sn.strip(), ""
+    return left.strip(), right.strip()
+
+def field_label_and_value(n: ET.Element) -> tuple[str, str]:
+    # Prefer splitting showname; then merge in attrs so nothing is lost.
+    showname = n.get("showname") or ""
+    left, right = split_showname(showname)
+
+    # Base label/value
+    label = left or n.get("name") or n.get("show") or "field"
+    value_parts = []
+
+    # Right side of showname (if any)
+    if right:
+        value_parts.append(right)
+
+    # PDML attributes (only add if they add new info)
+    attr_show = n.get("show")
+    attr_value = n.get("value")
+    # Avoid duplicate when right already equals attr_show
+    for extra in (attr_show, attr_value):
+        if extra and extra not in value_parts:
+            value_parts.append(extra)
+
+    return label, " | ".join(value_parts)
 
 def render_field_rows(n: ET.Element, level: int, rows_out: list[str]) -> None:
-    desc = (EM * level) + safe(field_label(n))
-    val  = safe(field_value(n))
-    rows_out.append(f"<tr><td>{desc}</td><td>{val}</td></tr>\n")
+    label, val = field_label_and_value(n)
+    desc = (EM * level) + safe(label)
+    rows_out.append(f"<tr><td>{desc}</td><td>{safe(val)}</td></tr>\n")
     for child in n.findall("field"):
         render_field_rows(child, level + 1, rows_out)
 
@@ -77,9 +94,6 @@ def proto_title(p: ET.Element) -> str:
     return p.get("showname") or p.get("name") or "proto"
 
 def render_proto_block(proto: ET.Element) -> str:
-    name = (proto.get("name") or "").lower()
-    if name in SKIP_PROTO_NAMES:
-        return ""
     title = safe(proto_title(proto))
     rows = [f"<tr><td colspan='2'><b>{title}</b></td></tr>\n"]
     for f in proto.findall("field"):
