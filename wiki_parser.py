@@ -1,168 +1,164 @@
-#!/usr/bin/env python3
-# pcap_to_html.py — batch convert ./pcap/*.pcap → ./html/*.html
-# Markup-only (no JS, no CSS). Preserve ALL PDML content and order.
-
+# pcap_to_html.py — PDML -> zero-JS, markup-only HTML in Kayla's decode table style
 import os
-import sys
+import re
 import argparse
 from subprocess import run, PIPE
-import html as htmlesc
+from typing import List, Tuple
 import lxml.etree as et
 
-EM = "\u2003"  # Wireshark-like indent
+TSHARK = r"C:\Program Files\Wireshark\tshark.exe"
+EM = "\u2003"  # U+2003 em space for indent
+SKIP_PROTOS = {"fake-field-wrapper"}  # do not render this wrapper
+HTML_TITLE_RE = re.compile(br"<title>.*?</title>", re.DOTALL)
 
-HTML_HEADER = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<title>{title}</title>
-</head>
-<body>
-<h1>Packet Decode</h1>
-"""
+def run_tshark_pdml(pcap_path: str) -> bytes:
+    """Return PDML bytes from tshark."""
+    result = run([TSHARK, "-I", "-T", "pdml", "-r", pcap_path], stdout=PIPE, stderr=PIPE)
+    if result.returncode != 0:
+        raise RuntimeError(f"tshark error on {pcap_path}:\n{result.stderr.decode(errors='replace')}")
+    return result.stdout
 
-HTML_FOOTER = """
-</body>
-</html>
-"""
-
-# Attributes we don't duplicate in the bracket dump (structural/noise)
-_ATTR_EXCLUDE = {
-    "name", "showname", "show", "value", "pos", "size",
-    "unmaskedvalue", "unmaskedshow", "unmaskedname",  # keep these unless empty
-    "hide"
-}
-
-def _safe(s: str) -> str:
-    return htmlesc.escape("" if s is None else str(s), quote=True)
-
-def _split_showname(sn: str):
-    # "Foo: Bar: Baz" => ("Foo", "Bar: Baz"). If no colon, value is empty.
-    if not sn:
+def split_showname(showname: str) -> Tuple[str, str]:
+    """
+    Split a Wireshark 'showname' like 'Frame Length: 92 bytes (736 bits)'
+    into ('Frame Length', '92 bytes (736 bits)').
+    If no colon, treat whole thing as description.
+    """
+    if not showname:
         return "", ""
-    left, sep, right = sn.partition(":")
-    if not sep:
-        return sn.strip(), ""
-    return left.strip(), right.strip()
+    parts = showname.split(": ", 1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return showname.strip(), ""
 
-def _field_label_value(n: et._Element):
-    # Build the most complete label/value possible.
-    sn = n.get("showname") or ""
-    left, right = _split_showname(sn)
-    label = left or n.get("name") or n.get("show") or "field"
-
-    parts = []
-    if right:
-        parts.append(right)
-
-    # Add show/value if present (keep even if duplicate; we want "everything")
-    for k in ("show", "value", "unmaskedshow", "unmaskedvalue"):
-        v = n.get(k)
-        if v:
-            parts.append(v)
-
-    # Add pos/size if present
-    for k in ("pos", "size"):
-        v = n.get(k)
-        if v:
-            parts.append(f"{k}={v}")
-
-    # Dump any remaining attributes so nothing is lost
-    extras = []
-    for k, v in n.items():
-        if k in _ATTR_EXCLUDE:
-            continue
-        if v is None or v == "":
-            continue
-        extras.append(f"{k}={v}")
-    if extras:
-        parts.append("[" + ", ".join(extras) + "]")
-
-    return label, " | ".join(parts)
-
-def _render_field(n: et._Element, level: int, out_chunks: list):
-    # Render this field
-    label, val = _field_label_value(n)
-    out_chunks.append(
-        f"<tr><td>{EM * level}{_safe(label)}</td><td>{_safe(val)}</td></tr>\n"
-    )
-    # Recurse into children, preserving order
-    for child in n:
-        if child.tag == "field":
-            _render_field(child, level + 1, out_chunks)
-        elif child.tag == "proto":
-            _render_proto(child, level + 1, out_chunks)
-
-def _proto_title(p: et._Element) -> str:
-    return p.get("showname") or p.get("name") or "proto"
-
-def _render_proto(p: et._Element, level: int, out_chunks: list):
-    title = _safe(_proto_title(p))
-    rows = [f"<tr><td colspan='2'><b>{title}</b></td></tr>\n"]
-
-    # Collect body rows in original order
-    body_chunks = []
-    for child in p:
-        if child.tag == "field":
-            _render_field(child, 0, body_chunks)
-        elif child.tag == "proto":
-            # nested proto: render into its own <details>
-            nested_chunks = []
-            _render_proto(child, 0, nested_chunks)
-            body_chunks.append("".join(nested_chunks))
-
-    table_html = "<table>\n" + "".join(rows) + "".join(body_chunks) + "</table>\n"
-    out_chunks.append(f"<details><summary>{title}</summary>\n{table_html}</details>\n")
-
-def _render_packet(pkt: et._Element, idx: int, out_chunks: list):
-    out_chunks.append(f"<h2>Packet {idx}</h2>\n")
-    inner = []
-    # Preserve proto order exactly as in PDML
-    for p in pkt.findall("proto"):
-        _render_proto(p, 0, inner)
-    out_chunks.append(
-        f"<details><summary>Packet {idx} details</summary>\n{''.join(inner)}</details>\n"
+def row_html(tr_class: str, desc: str, value: str) -> str:
+    return (
+        f'   <tr class="{tr_class}">\n'
+        f'      <td class="description">{desc}</td>\n'
+        f'      <td class="space">&nbsp;</td>\n'
+        f'      <td class="value">{value}</td>\n'
+        f'   </tr>\n'
     )
 
-def pdml_to_html(dom: et._Element, title: str) -> bytes:
+def spacer_row() -> str:
+    return '   <tr><td class="space">&nbsp;</td></tr>\n'
+
+def html_esc(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def collect_fields_rows(node, depth: int, rows: List[str], next_is_even: List[bool]) -> None:
+    """
+    Depth-first over <field> nodes, rendering Wireshark-style key/value rows.
+    depth controls EM-space indentation of the 'description' cell.
+    next_is_even is a one-item list used as a mutable toggle for even/odd classes.
+    """
+    showname = node.get("showname") or node.get("name") or ""
+    desc, value = split_showname(showname)
+    # Fallbacks: if value empty, try 'show' or 'value' attrs
+    if not value:
+        value = node.get("show") or node.get("value") or ""
+
+    # Indent description with EM spaces
+    indented_desc = (EM * depth) + html_esc(desc)
+    tr_class = "even-tr" if next_is_even[0] else "odd-tr"
+    next_is_even[0] = not next_is_even[0]
+
+    rows.append(row_html(tr_class, indented_desc, html_esc(value)))
+
+    # Recurse into child fields
+    for child in node.findall("field"):
+        collect_fields_rows(child, depth + 1, rows, next_is_even)
+
+def packet_table_html(packet, title_anchor: str) -> str:
+    """
+    Build one <table class="decode"> for a packet.
+    Within the table, each protocol gets a <tr class="frame"> header, then its fields.
+    """
+    # Protocol list for the frame summary line
+    protos = [p.get("name") for p in packet.findall("proto") if p.get("name") not in SKIP_PROTOS]
+    frame_line = f'⇒ Frame {packet.get("showname", "") or ""}: ' + ", ".join(protos)
+
+    rows: List[str] = []
+    next_is_even = [True]  # toggle holder
+
+    # Emit a header + fields per proto
+    for proto in packet.findall("proto"):
+        pname = proto.get("name") or ""
+        if pname in SKIP_PROTOS:
+            continue
+
+        # Section header
+        rows.append(
+            '   <tr class="frame">\n'
+            f'      <td class="description">{html_esc(pname)}</td>\n'
+            '      <td class="space">&nbsp;</td>\n'
+            '      <td class="value"></td>\n'
+            '   </tr>\n'
+        )
+
+        # Fields inside this proto
+        for field in proto.findall("field"):
+            collect_fields_rows(field, depth=1, rows=rows, next_is_even=next_is_even)
+
+        # Spacer between protos
+        rows.append(spacer_row())
+
+    # Wrap with table
+    table = []
+    table.append('<table class="decode">\n')
+    # Optional: top summary line as its own header block
+    table.append(
+        '   <tr class="frame">\n'
+        f'      <td class="description">{html_esc(frame_line)}</td>\n'
+        '      <td class="space">&nbsp;</td>\n'
+        '      <td class="value"></td>\n'
+        '   </tr>\n'
+    )
+    table.append(spacer_row())
+    table.extend(rows)
+    table.append('</table>\n')
+
+    # Prepend a section <h2> with anchor
+    h2 = f'<h2><a class="title_anchor" name="{html_esc(title_anchor)}"></a>{html_esc(title_anchor)}<br></h2>\n'
+    return h2 + "".join(table)
+
+def pdml_to_markup_html(pdml_bytes: bytes, page_title: str) -> bytes:
+    """Convert PDML to your markup-only HTML page."""
+    dom = et.fromstring(pdml_bytes)
     packets = dom.findall(".//packet")
-    parts = [HTML_HEADER.format(title=_safe(title))]
-    for i, pkt in enumerate(packets, start=1):
-        _render_packet(pkt, i, parts)
-    parts.append(HTML_FOOTER)
-    return "".join(parts).encode("utf-8")
 
-# ---------- pipeline identical shape to your XSLT script ----------
+    body_parts: List[str] = []
+    for idx, pkt in enumerate(packets, start=1):
+        # Example anchor/title per packet
+        anchor = f"decode_{idx}"
+        body_parts.append(packet_table_html(pkt, anchor))
+
+    # Minimal HTML skeleton (no CSS/JS; only classes)
+    html = (
+        "<!DOCTYPE html>\n"
+        "<html>\n"
+        "  <head>\n"
+        f"    <title>{html_esc(page_title)}</title>\n"
+        "    <meta charset=\"utf-8\"/>\n"
+        "  </head>\n"
+        "  <body>\n"
+        + "".join(body_parts) +
+        "  </body>\n"
+        "</html>\n"
+    )
+    return html.encode("utf-8")
 
 def pcap_to_html(pcap_file_path: str, html_file_path: str) -> None:
-    if os.path.exists(html_file_path):
-        print(f"HTML file already exists: {html_file_path}. Skipping creation.")
-        return
-
-    tshark_path = r"C:\Program Files\Wireshark\tshark.exe"
-
-    result = run(
-        [tshark_path, "-I", "-T", "pdml", "-r", pcap_file_path],
-        stdout=PIPE,
-        stderr=PIPE
-    )
-    if result.returncode != 0:
-        print(f"Error running tshark on {pcap_file_path}:", result.stderr.decode(errors="replace"))
-        return
-
-    try:
-        dom = et.fromstring(result.stdout)
-    except et.XMLSyntaxError as e:
-        print(f"PDML parse error for {pcap_file_path}: {e}")
-        return
-
-    html_bytes = pdml_to_html(dom, os.path.basename(pcap_file_path))
+    """PCAP -> PDML -> markup-only HTML."""
+    pdml = run_tshark_pdml(pcap_file_path)
+    html_bytes = pdml_to_markup_html(pdml, os.path.basename(pcap_file_path))
     os.makedirs(os.path.dirname(html_file_path), exist_ok=True)
     with open(html_file_path, "wb") as f:
         f.write(html_bytes)
     print(f"HTML file created: {html_file_path}")
 
 def needs_update(pcap_path: str, html_path: str) -> bool:
+    """True if HTML missing or older than PCAP."""
     if not os.path.exists(html_path):
         return True
     return os.path.getmtime(pcap_path) > os.path.getmtime(html_path)
@@ -181,8 +177,8 @@ def main(pcap_folder: str, html_folder: str) -> None:
                 print(f"Up-to-date HTML exists for {filename}, skipping.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Batch convert PCAP files to HTML (markup-only)")
+    parser = argparse.ArgumentParser(description="Batch convert PCAP files to markup-only HTML (no JS/XSLT)")
     parser.add_argument("--pcap_dir", default="pcap", help="Directory containing PCAP files")
-    parser.add_argument("--html_dir", default="html", help="Directory to save HTML files")
+    parser.add_argument("--html_dir", default="HTML", help="Directory to save HTML files")
     args = parser.parse_args()
     main(args.pcap_dir, args.html_dir)
