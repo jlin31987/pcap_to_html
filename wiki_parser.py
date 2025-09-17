@@ -3,10 +3,11 @@ import lxml.etree as et
 from subprocess import run, PIPE
 import argparse
 
+
 EM_SPACE = "\u2003"     
-NBSP = "\u00A0"         
-INDENT_MODE = "nbsp"   
-NBSP_PER_LEVEL = 4      
+NBSP = "\u00A0"
+INDENT_MODE = "nbsp"
+NBSP_PER_LEVEL = 4
 
 SKIP_PROTO_NAMES = {"fake-field-wrapper", "geninfo"}
 
@@ -24,6 +25,32 @@ def run_tshark_pdml(pcap_file_path, tshark_path=r"C:\Program Files\Wireshark\tsh
     if result.returncode != 0:
         raise RuntimeError(f"tshark failed on {pcap_file_path}:\n{result.stderr.decode(errors='ignore')}")
     return et.fromstring(result.stdout)
+
+def extract_desc_value(fld) -> tuple[str, str]:
+    showname = (fld.get("showname") or "").strip()
+    show = (fld.get("show") or "").strip()
+    raw = (fld.get("value") or "").strip()
+    name = (fld.get("name") or "").strip()
+
+    for sep in (":", " = "):
+        if sep in showname:
+            left, right = showname.split(sep, 1)
+            label = left.strip() or name or showname
+            val = (right.strip() or show or raw)
+            break
+    else:
+        label = name or showname
+        val = show if (show and show != showname) else raw
+
+    if val == label or val == showname:
+        if show and show not in (label, showname):
+            val = show
+        elif raw and raw not in (label, showname):
+            val = raw
+        else:
+            val = ""
+
+    return label, val
 
 def pdml_to_plain_html(pdml_root: et._Element, pcap_basename: str) -> et._Element:
     html = et.Element("html")
@@ -71,13 +98,7 @@ def pdml_to_plain_html(pdml_root: et._Element, pcap_basename: str) -> et._Elemen
 
             def emit_fields(elem: et._Element, depth: int):
                 for fld in elem.findall("./field"):
-                    showname = (fld.get("showname") or fld.get("name") or "")
-                    value = fld.get("show") or fld.get("value") or ""
-                    desc = showname
-                    if not value and ":" in showname:
-                        left, right = showname.split(":", 1)
-                        # keep LHS spacing except trailing; don't nuke potential inner spaces
-                        desc, value = left.rstrip(), right.strip()
+                    desc, value = extract_desc_value(fld)
                     add_field_row(desc, value, depth)
 
                     if fld.find("./field") is not None or fld.find("./proto") is not None:
