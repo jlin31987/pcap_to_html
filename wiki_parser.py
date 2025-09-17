@@ -3,15 +3,24 @@ import lxml.etree as et
 from subprocess import run, PIPE
 import argparse
 
-EM_SPACE = "\u2003"  
+EM_SPACE = "\u2003"     
+NBSP = "\u00A0"         
+INDENT_MODE = "nbsp"   
+NBSP_PER_LEVEL = 4      
+
 SKIP_PROTO_NAMES = {"fake-field-wrapper", "geninfo"}
 
+def make_indent(depth: int) -> str:
+    if depth <= 0:
+        return ""
+    if INDENT_MODE == "emsp":
+        return EM_SPACE * depth
+    if INDENT_MODE == "emsp_nbsp":
+        return (EM_SPACE + NBSP) * depth
+    return NBSP * (NBSP_PER_LEVEL * depth)
+
 def run_tshark_pdml(pcap_file_path, tshark_path=r"C:\Program Files\Wireshark\tshark.exe") -> et._Element:
-    result = run(
-        [tshark_path, "-I", "-T", "pdml", "-r", pcap_file_path],
-        stdout=PIPE,
-        stderr=PIPE
-    )
+    result = run([tshark_path, "-I", "-T", "pdml", "-r", pcap_file_path], stdout=PIPE, stderr=PIPE)
     if result.returncode != 0:
         raise RuntimeError(f"tshark failed on {pcap_file_path}:\n{result.stderr.decode(errors='ignore')}")
     return et.fromstring(result.stdout)
@@ -55,18 +64,20 @@ def pdml_to_plain_html(pdml_root: et._Element, pcap_basename: str) -> et._Elemen
                 nonlocal row_i
                 trf = et.SubElement(table, "tr", attrib={"class": row_classes[row_i % 2]})
                 row_i += 1
-                et.SubElement(trf, "td", attrib={"class": "description"}).text = f"{EM_SPACE * depth}{desc_text}"
+                dcell = et.SubElement(trf, "td", attrib={"class": "description"})
+                dcell.text = f"{make_indent(depth)}{desc_text}"
                 et.SubElement(trf, "td", attrib={"class": "space"}).text = "\u00A0"
                 et.SubElement(trf, "td", attrib={"class": "value"}).text = value_text
 
             def emit_fields(elem: et._Element, depth: int):
                 for fld in elem.findall("./field"):
-                    showname = fld.get("showname") or fld.get("name") or ""
+                    showname = (fld.get("showname") or fld.get("name") or "")
                     value = fld.get("show") or fld.get("value") or ""
                     desc = showname
                     if not value and ":" in showname:
                         left, right = showname.split(":", 1)
-                        desc, value = left.strip(), right.strip()
+                        # keep LHS spacing except trailing; don't nuke potential inner spaces
+                        desc, value = left.rstrip(), right.strip()
                     add_field_row(desc, value, depth)
 
                     if fld.find("./field") is not None or fld.find("./proto") is not None:
@@ -99,9 +110,7 @@ def pcap_to_html(pcap_file_path, html_file_path):
     print(f"HTML file created: {html_file_path}")
 
 def needs_update(pcap_path, html_path):
-    if not os.path.exists(html_path):
-        return True
-    return os.path.getmtime(pcap_path) > os.path.getmtime(html_path)
+    return not os.path.exists(html_path) or os.path.getmtime(pcap_path) > os.path.getmtime(html_path)
 
 def main(pcap_folder, html_folder):
     os.makedirs(html_folder, exist_ok=True)
